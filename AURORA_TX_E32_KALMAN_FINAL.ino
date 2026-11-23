@@ -71,8 +71,8 @@ const float SHUNT_MAIN_OHM = 0.020f;   // R27 (Main SCC) = 20 mOhm
 const float SHUNT_PV_OHM   = 0.020f;   // R18 (PV)       = 20 mOhm
 const float SHUNT_BATT_OHM = 0.020f;   // R24 (BATT)     = 20 mOhm
 const float VCC_NTC        = 3.30f;
-const float R_PULLUP       = 10000.0f;
-const float NTC_R25        = 10000.0f;
+const float R_PULLUP       = 33000.0f;   // pull-up 33 kOhm ke 3.3 V
+const float NTC_R25        = 100000.0f;  // NTC 100 kOhm (pull-down ke GND) @ 25 C
 const float NTC_BETA       = 3950.0f;
 
 // ================= PWM / Timing =================
@@ -911,17 +911,12 @@ void readAll() {
   data.lmOk = readLM75B(t);
   data.tBoard = data.lmOk ? t : NAN;
 
-  // 3. Hanya baca NTC yang terpasang: NTC1 (ADS ch 0) dan NTC3 (ADS ch 2)
-  //    NTC2, NTC4, dan NTC5 dikunci NAN agar tidak membaca noise pin mengambang (floating)
+  // 3. Hanya NTC3 (ADS ch 2) = suhu heatsink LAMPU yang dibaca. NTC lain dikunci NAN.
   for (int i = 0; i < 5; i++) {
     data.ntcV[i] = NAN;
     data.ntcT[i] = NAN;
   }
-  float vNtc1, vNtc3;
-  if (readADS1115(0, vNtc1)) {
-    data.ntcV[0] = vNtc1;
-    data.ntcT[0] = ntcTempC(vNtc1); // NTC1
-  }
+  float vNtc3;
   if (readADS1115(2, vNtc3)) {
     data.ntcV[2] = vNtc3;
     data.ntcT[2] = ntcTempC(vNtc3); // NTC3
@@ -973,7 +968,7 @@ String maskLabels(uint16_t m) {
 }
 
 // Susun baris CSV standar (23 kolom) untuk LoRa & Serial:
-// t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label
+// t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label
 // ---------------------------------------------------------------------
 // Rata-rata LoRa: setiap baris 1 Hz diakumulasi; paket LoRa (tiap 5 s) membawa RATA-RATA nilai
 // analog selama jendela itu, OR semua anomali (fault_mask), dan kode utama = anomali berprioritas
@@ -1068,9 +1063,7 @@ String buildCsvRow() {
   addField(row, data.battOk, data.battV,   3); // V_bat
   addField(row, data.battOk, data.battA,   4); // I_bat
   addField(row, data.battOk, data.battAsq, 4); // I_bat_sq
-  for (int i = 0; i < 5; i++) {
-    addField(row, !isnan(data.ntcT[i]), data.ntcT[i], 1); // NTC1..NTC5
-  }
+  addField(row, !isnan(data.ntcT[2]), data.ntcT[2], 1);   // NTC3 = suhu lampu
   addField(row, data.lmOk,    data.tBoard, 2); // T_LM75
   addField(row, data.bhOk[0], data.lux[0], 1); // lux_amb
   addField(row, data.bhOk[1], data.lux[1], 1); // lux_lamp
@@ -1083,7 +1076,7 @@ String buildCsvRow() {
 
 // Cetak header CSV untuk mempermudah olah data di Excel / Python
 void printCsvHeader() {
-  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc,pir_cnt"));
+  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc,pir_cnt"));
 }
 
 // Cetak baris CSV lengkap ke Serial Monitor (22 kolom utama + 7 kolom diagnostik Kalman/NIS + 2 kolom Ground Truth)
@@ -1128,11 +1121,7 @@ void printAll() {
   printFloatField("V_bat",    data.battOk, data.battV,   2);
   printFloatField("I_bat",    data.battOk, data.battA,   3);
   printFloatField("I_bat_sq", data.battOk, data.battAsq, 4);
-  printFloatField("NTC1",     !isnan(data.ntcT[0]), data.ntcT[0], 1);
-  printFloatField("NTC2",     !isnan(data.ntcT[1]), data.ntcT[1], 1);
-  printFloatField("NTC3",     !isnan(data.ntcT[2]), data.ntcT[2], 1);
-  printFloatField("NTC4",     !isnan(data.ntcT[3]), data.ntcT[3], 1);
-  printFloatField("NTC5",     !isnan(data.ntcT[4]), data.ntcT[4], 1);
+  printFloatField("T_lampu",  !isnan(data.ntcT[2]), data.ntcT[2], 1);   // NTC3
   printFloatField("T_LM75",   data.lmOk,    data.tBoard, 2);
   printFloatField("lux_amb",  data.bhOk[0], data.lux[0], 1);
   printFloatField("lux_lamp", data.bhOk[1], data.lux[1], 1);
@@ -1232,7 +1221,15 @@ int computeLuxOnlyTarget(float luxAmb) {
 // Hitung target PWM berdasarkan BH1750 Ambient + Sensor Gerak PIR untuk Mode Dengan PIR
 int computeLuxPirTarget(float luxAmb) {
   // Jika kondisi lingkungan masih terang (Siang >= 120 lux), lampu wajib OFF (0%)
-  if (!isnan(luxAmb) && luxAmb >= 120.0f) {
+  // Siang? Sensor cahaya utama; daya/tegangan panel surya sebagai umpan balik kedua:
+  //  - lux valid: siang bila lux >= 120, ATAU panel jelas sedang terkena matahari (P_pv >= 5 W)
+  //    (mis. sensor lux tertutup/kotor di siang hari -> lampu tetap mati)
+  //  - lux tidak valid: siang bila V_pv >= 12 V atau P_pv >= 1 W (malam V_pv ~1.5 V)
+  bool pvOkNow = data.pvOk && !isnan(data.pvV) && !isnan(data.pvW);
+  bool isDay = !isnan(luxAmb)
+               ? (luxAmb >= 120.0f || (pvOkNow && data.pvW >= 5.0f))
+               : (pvOkNow && (data.pvV >= 12.0f || data.pvW >= 1.0f));
+  if (isDay) {
     pirMotionActive = false;
     return 0;
   }
@@ -1548,7 +1545,7 @@ uint8_t xorChecksum(const String &s) {
 }
 
 // Format Paket LoRa tetap identik dengan sistem penerima:
-// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc,pir_cnt*CS
+// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc,pir_cnt*CS
 // fault_mask: bit k = kode anomali k aktif (dashboard: (mask >> k) & 1)
 void loraSend() {
   if (!loraCfgOk) { consecutiveLoraTimeout++; return; }   // jangan memancar dengan parameter yang belum terbukti
@@ -1765,7 +1762,11 @@ void setup() {
   beep(2);
   // Mulai pada PWM 0% (Manual) agar aman saat pertama disambung ke Panel Surya + Baterai
   // Ketik angka 0..100, 't', 'd', atau 'a' kapan saja di Serial Monitor untuk mengubah mode PWM
-  setManualPWM(0);
+  // Mode default saat boot: ADAPTIVE DIMMING (sensor cahaya + panel surya + PIR).
+  // Sesi logging / duty manual / mode lain dipilih lewat perintah Serial.
+  applySyncedPWM(0);
+  targetPercent = 0;
+  startAdaptivePirMode();
   lastLoRa = millis();
 
   // Langsung cetak header CSV pertama kali saat boot
