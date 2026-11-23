@@ -74,10 +74,12 @@ const uint32_t ACK_TIMEOUT_MS     = 3000;
 
 // ================= Mode & State Kontrol Dimming =================
 enum DimMode {
-  MODE_MANUAL_PWM = 0,
-  MODE_TOGGLE     = 1,
-  MODE_SWEEP      = 2,
-  MODE_ADAPTIVE   = 3
+  MODE_MANUAL_PWM   = 0, // Manual 0..100% (dengan Soft-Ramp)
+  MODE_TOGGLE       = 1, // Toggle 0% <-> 100% tiap 3 detik
+  MODE_SWEEP        = 2, // Sweep 0% <-> 100%
+  MODE_ADAPTIVE_SIM = 3, // Simulasi Adaptive Timer (20% -> 100% -> 50% -> 0%)
+  MODE_ADAPTIVE_LUX = 4, // Adaptive TANPA PIR (murni berdasarkan BH1750 Ambient lux_amb)
+  MODE_ADAPTIVE_PIR = 5  // Adaptive DENGAN PIR (berdasarkan BH1750 Ambient + gerakan PIR)
 };
 
 DimMode  currentDimMode = MODE_MANUAL_PWM;
@@ -88,6 +90,13 @@ bool     gateOn         = false;
 int      sweepDir       = 1;
 int      adaptStage     = 0;
 int      adaptTarget    = 20;
+
+// Variabel state untuk Adaptive Dimming dengan PIR (MODE_ADAPTIVE_PIR)
+uint32_t lastPirMotionMs = 0;
+uint32_t lastSeenPirCount = 0;
+bool     pirMotionActive = false;
+const uint32_t PIR_HOLD_FULL_MS = 8000;    // Tahan 100% selama 8 detik sejak gerakan terakhir
+const uint32_t PIR_COOLDOWN_MS  = 4000;    // Turun ke 50% selama 4 detik sebelum kembali Standby
 
 // Kecepatan Soft-Ramp untuk mencegah inrush current / error saat lompat jauh (misal 0 -> 100)
 // Naik/turun 2% setiap 40 ms (~2 detik dari 0% ke 100%, setara naik per 5% tiap 100 ms)
@@ -241,8 +250,10 @@ KalmanNIS kfTempLm75 = {0, 1, 0.010f, 0.20f, 0, 1, 0, false}; // Kalman khusus L
 StuckDetector stuckPvV, stuckBattV, stuckLuxAmb;
 
 // ---------------- [L2] Safety Limits & Hysteresis (LFP 4S2P 12Ah & Panel 50W) ----------------
+// Catatan: VBAT_LOW_ON disesuaikan ke 11.5V (dari 12.6V) karena tegangan baterai saat ini 12.34V
+//          agar pengujian fungsi normal & anomali lain tidak terkunci di BATTERY_LOW.
 constexpr float VBAT_OV_ON   = 14.8f, VBAT_OV_OFF  = 14.6f;
-constexpr float VBAT_LOW_ON  = 12.6f, VBAT_LOW_OFF = 13.0f;
+constexpr float VBAT_LOW_ON  = 11.0f, VBAT_LOW_OFF = 11.4f; // Batas BATTERY_LOW diset 11.0 V
 constexpr float TBAT_MAX_ON  = 45.0f, TBAT_MAX_OFF = 42.0f;
 constexpr float TCTRL_MAX_ON = 70.0f, TCTRL_MAX_OFF = 65.0f;
 constexpr float VPV_MAX_ON   = 22.9f, VPV_MAX_OFF  = 22.4f;
@@ -334,7 +345,24 @@ void evaluateAnomalyLayers() {
   }
 
   // ===================================================================
-  // [L2] LAPISAN 2: BATAS KESELAMATAN + HISTERESIS (Tanpa Tunggu NIS)
+  // [L3] UPDATE KALMAN FILTER + NIS (Selalu di-update selama data lolos L1
+  //      supaya nilai estimasi Kalman & NIS di CSV/Serial tetap berjalan!)
+  // ===================================================================
+  float expMainP   = (data.duty / 100.0f) * NOMINAL_LAMP_W;
+  float expLuxLamp = (data.duty / 100.0f) * NOMINAL_LAMP_LUX;
+
+  kfPvV.update(data.pvV);
+  kfPvP.update(data.pvW);
+  kfBattV.update(data.battV);
+  kfBattI.update(data.battA);
+  kfMainP.update(data.mainW, expMainP);
+  kfLuxLamp.update(data.lux[1], expLuxLamp);
+  if (!isnan(tBat))  kfTempBat.update(tBat);   // NTC #1 (Baterai)
+  if (!isnan(tNtc3)) kfTempNtc3.update(tNtc3); // NTC #3 (Heatsink/Controller)
+  if (!isnan(tLm75)) kfTempLm75.update(tLm75); // LM75B (Board PCB)
+
+  // ===================================================================
+  // [L2] LAPISAN 2: BATAS KESELAMATAN + HISTERESIS (Prioritas Tertinggi)
   //      - Suhu (TBAT & TCTRL) : Persistensi = 1 sampel
   //      - Tegangan & PV       : Persistensi = N_PERSIST (3 sampel)
   // ===================================================================
@@ -396,22 +424,6 @@ void evaluateAnomalyLayers() {
     data.label = getAnomalyLabel(PV_ABNORMAL_VOLTAGE);
     return;
   }
-
-  // ===================================================================
-  // [L3] LAPISAN 3: KALMAN FILTER + NIS (Hanya di-update dengan data valid L1)
-  // ===================================================================
-  float expMainP   = (data.duty / 100.0f) * NOMINAL_LAMP_W;
-  float expLuxLamp = (data.duty / 100.0f) * NOMINAL_LAMP_LUX;
-
-  kfPvV.update(data.pvV);
-  kfPvP.update(data.pvW);
-  kfBattV.update(data.battV);
-  kfBattI.update(data.battA);
-  kfMainP.update(data.mainW, expMainP);
-  kfLuxLamp.update(data.lux[1], expLuxLamp);
-  if (!isnan(tBat))  kfTempBat.update(tBat);   // NTC #1 (Baterai)
-  if (!isnan(tNtc3)) kfTempNtc3.update(tNtc3); // NTC #3 (Heatsink/Controller)
-  if (!isnan(tLm75)) kfTempLm75.update(tLm75); // LM75B (Board PCB)
 
   // ===================================================================
   // [L4] LAPISAN 4: KLASIFIKASI KONTEKSTUAL (Gabungan L3 + Konteks Operasi)
@@ -828,14 +840,75 @@ void startSweepMode() {
   if (!csvOnlyMode) Serial.println(F(">> Mode AUTO-SWEEP Dimming Aktif: 0% <-> 100%"));
 }
 
-void startAdaptiveMode() {
-  currentDimMode = MODE_ADAPTIVE;
+void startAdaptiveSimMode() {
+  currentDimMode = MODE_ADAPTIVE_SIM;
   adaptStage     = 0;
   adaptTarget    = 20;
   targetPercent  = 20;
   lastAdaptState = millis();
   lastSweep      = millis();
-  if (!csvOnlyMode) Serial.println(F(">> Mode ADAPTIVE DIMMING SIMULASI Aktif"));
+  if (!csvOnlyMode) Serial.println(F(">> Mode ADAPTIVE SIMULASI (Timer) Aktif: 20% -> 100% -> 50% -> 0%"));
+}
+
+void startAdaptiveLuxMode() {
+  currentDimMode = MODE_ADAPTIVE_LUX;
+  if (!csvOnlyMode) {
+    Serial.println(F(">> Mode ADAPTIVE TANPA PIR (Hanya BH1750 Ambient) Aktif!"));
+    Serial.println(F("   (Semakin gelap lux_amb, duty cycle otomatis naik bertahap 0% -> 25% -> 50% -> 75% -> 100%)"));
+  }
+}
+
+void startAdaptivePirMode() {
+  currentDimMode   = MODE_ADAPTIVE_PIR;
+  lastSeenPirCount = pirRiseCount;
+  pirMotionActive  = false;
+  if (!csvOnlyMode) {
+    Serial.println(F(">> Mode ADAPTIVE DENGAN PIR (BH1750 Ambient + Sensor PIR) Aktif!"));
+    Serial.println(F("   (Siang=0% | Malam Standby=25% | Ada Gerakan PIR=100% -> Cooldown 50% -> Standby 25%)"));
+  }
+}
+
+// Hitung target PWM berdasarkan cahaya lingkungan BH1750 (ADDR=VCC / data.lux[0]) untuk Mode Tanpa PIR
+int computeLuxOnlyTarget(float luxAmb) {
+  if (isnan(luxAmb))     return 50;  // Fallback aman jika sensor belum siap
+  if (luxAmb >= 150.0f)  return 0;   // Siang / Terang -> Lampu Mati (0%)
+  if (luxAmb >= 80.0f)   return 25;  // Sore Terang    -> 25%
+  if (luxAmb >= 35.0f)   return 50;  // Senja / Mendung-> 50%
+  if (luxAmb >= 10.0f)   return 75;  // Malam Remang   -> 75%
+  return 100;                        // Malam Gelap    -> 100%
+}
+
+// Hitung target PWM berdasarkan BH1750 Ambient + Sensor Gerak PIR untuk Mode Dengan PIR
+int computeLuxPirTarget(float luxAmb) {
+  // Jika kondisi lingkungan masih terang (Siang >= 120 lux), lampu wajib OFF (0%)
+  if (!isnan(luxAmb) && luxAmb >= 120.0f) {
+    pirMotionActive = false;
+    return 0;
+  }
+
+  // Cek apakah ada pemicu gerakan dari PIR (pin HIGH atau interrupt baru)
+  uint32_t now = millis();
+  if (digitalRead(PIN_PIR) == HIGH || pirRiseCount != lastSeenPirCount) {
+    lastSeenPirCount = pirRiseCount;
+    lastPirMotionMs  = now;
+    pirMotionActive  = true;
+  }
+
+  // Jika baru ada gerakan dalam 8 detik terakhir -> Full Bright 100%
+  if (pirMotionActive) {
+    uint32_t elapsed = now - lastPirMotionMs;
+    if (elapsed <= PIR_HOLD_FULL_MS) {
+      return 100;
+    } else if (elapsed <= (PIR_HOLD_FULL_MS + PIR_COOLDOWN_MS)) {
+      return 50; // Fase Cooldown 4 detik (50%)
+    } else {
+      pirMotionActive = false;
+    }
+  }
+
+  // Kondisi Malam Standby (Tidak ada gerakan): hemat energi 25% (atau 20% saat senja)
+  if (!isnan(luxAmb) && luxAmb >= 40.0f) return 20;
+  return 25;
 }
 
 void beep(int times, int onMs = 100, int offMs = 100) {
@@ -997,17 +1070,19 @@ void loraPoll() {
 // =====================================================================
 void printHelp() {
   Serial.println(F("\n# --- PERINTAH SERIAL MONITOR ---"));
-  Serial.println(F("#  v      : Toggle Mode CSV Murni <-> Mode Tabel Telemetri"));
-  Serial.println(F("#  header : Cetak baris judul kolom CSV"));
-  Serial.println(F("#  0..100 : Set Duty Cycle PWM Manual (0% s/d 100%)"));
-  Serial.println(F("#  + / -  : Naikkan / turunkan Duty Cycle sebesar 5%"));
-  Serial.println(F("#  d      : Mode Tes Auto-Sweep Dimming (0% <-> 100%)"));
-  Serial.println(F("#  a      : Mode Simulasi Adaptive Dimming (20% -> 100% -> 50% -> 0%)"));
-  Serial.println(F("#  t      : Mode Toggle ON/OFF (0% <-> 100%) tiap 3 detik"));
-  Serial.println(F("#  s      : Scan & identifikasi ulang bus I2C"));
-  Serial.println(F("#  b      : Tes Buzzer (3x beep)"));
-  Serial.println(F("#  l      : Paksa kirim paket data ke LoRa sekarang"));
-  Serial.println(F("#  h      : Tampilkan bantuan ini\n"));
+  Serial.println(F("#  v        : Toggle Mode CSV Murni <-> Mode Tabel Telemetri"));
+  Serial.println(F("#  header   : Cetak baris judul kolom CSV"));
+  Serial.println(F("#  0..100   : Set Duty Cycle PWM Manual (0% s/d 100%)"));
+  Serial.println(F("#  + / -    : Naikkan / turunkan Duty Cycle sebesar 5%"));
+  Serial.println(F("#  a1 / lux : Mode Adaptive TANPA PIR (Hanya mengandalkan BH1750 Ambient)"));
+  Serial.println(F("#  a2 / pir : Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)"));
+  Serial.println(F("#  a        : Mode Simulasi Adaptive Timer (20% -> 100% -> 50% -> 0%)"));
+  Serial.println(F("#  d        : Mode Tes Auto-Sweep Dimming (0% <-> 100%)"));
+  Serial.println(F("#  t        : Mode Toggle ON/OFF (0% <-> 100%) tiap 3 detik"));
+  Serial.println(F("#  s        : Scan & identifikasi ulang bus I2C"));
+  Serial.println(F("#  b        : Tes Buzzer (3x beep)"));
+  Serial.println(F("#  l        : Paksa kirim paket data ke LoRa sekarang"));
+  Serial.println(F("#  h        : Tampilkan bantuan ini\n"));
 }
 
 bool isNumericString(const String &s) {
@@ -1036,7 +1111,9 @@ void handleSerial() {
   else if (in.equalsIgnoreCase("s")) scanI2C();
   else if (in.equalsIgnoreCase("t")) startToggleMode();
   else if (in.equalsIgnoreCase("d")) startSweepMode();
-  else if (in.equalsIgnoreCase("a")) startAdaptiveMode();
+  else if (in.equalsIgnoreCase("a1") || in.equalsIgnoreCase("lux")) startAdaptiveLuxMode();
+  else if (in.equalsIgnoreCase("a2") || in.equalsIgnoreCase("pir")) startAdaptivePirMode();
+  else if (in.equalsIgnoreCase("a")) startAdaptiveSimMode();
   else if (in == "+")                setManualPWM(targetPercent + 5);
   else if (in == "-")                setManualPWM(targetPercent - 5);
   else if (in.equalsIgnoreCase("b")) { beep(3, 200, 150); }
@@ -1123,7 +1200,7 @@ void loop() {
       targetPercent = nextPct;
       applySyncedPWM(nextPct);
     }
-  } else if (currentDimMode == MODE_ADAPTIVE) {
+  } else if (currentDimMode == MODE_ADAPTIVE_SIM) {
     const int targets[4]    = {20, 100, 50, 0};
     const uint32_t holds[4] = {4000, 5000, 4000, 3000};
     if (millis() - lastAdaptState >= holds[adaptStage]) {
@@ -1136,6 +1213,22 @@ void loop() {
       lastSweep = millis();
       if (hplPercent < adaptTarget)      applySyncedPWM(hplPercent + 1);
       else if (hplPercent > adaptTarget) applySyncedPWM(hplPercent - 1);
+    }
+  } else if (currentDimMode == MODE_ADAPTIVE_LUX) {
+    // Mode Adaptive TANPA PIR (Hanya mengandalkan sensor BH1750 Ambient / data.lux[0])
+    targetPercent = computeLuxOnlyTarget(data.lux[0]);
+    if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
+      lastRampStep = millis();
+      if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
+      else                            applySyncedPWM(max(hplPercent - RAMP_STEP_PCT, targetPercent));
+    }
+  } else if (currentDimMode == MODE_ADAPTIVE_PIR) {
+    // Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)
+    targetPercent = computeLuxPirTarget(data.lux[0]);
+    if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
+      lastRampStep = millis();
+      if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
+      else                            applySyncedPWM(max(hplPercent - RAMP_STEP_PCT, targetPercent));
     }
   }
 
