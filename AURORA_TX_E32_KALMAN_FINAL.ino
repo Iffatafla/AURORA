@@ -134,6 +134,7 @@ bool csvOnlyMode = true;
 
 uint32_t lastToggle = 0, lastSweep = 0, lastAdaptState = 0, lastRead = 0, lastLoRa = 0;
 volatile uint32_t pirRiseCount = 0;
+uint32_t pirCountBase = 0;   // titik nol hitungan gerakan (perintah 'pr'); pirRiseCount sendiri tidak direset
 
 struct Readings {
   float t    = 0.0f;                                        // Waktu berjalan (detik)
@@ -1082,7 +1083,7 @@ String buildCsvRow() {
 
 // Cetak header CSV untuk mempermudah olah data di Excel / Python
 void printCsvHeader() {
-  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc"));
+  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc,pir_cnt"));
 }
 
 // Cetak baris CSV lengkap ke Serial Monitor (22 kolom utama + 7 kolom diagnostik Kalman/NIS + 2 kolom Ground Truth)
@@ -1104,6 +1105,7 @@ void printCsvSerial() {
   line += "," + String(getAnomalyLabel((AnomalyCode)injectedFault));
   line += String(",") + (data.loraTx ? "1" : "0");   // lora_tx
   addField(line, !isnan(socPct), socPct, 1);          // soc (%)
+  line += "," + String((unsigned long)(pirRiseCount - pirCountBase));  // pir_cnt: jumlah gerakan terdeteksi sejak boot
   Serial.println(line);
 }
 
@@ -1136,6 +1138,7 @@ void printAll() {
   printFloatField("lux_lamp", data.bhOk[1], data.lux[1], 1);
   Serial.printf("%-12s : %d\n", "PIR",      data.pir);
   printFloatField("SOC (%)",  !isnan(socPct), socPct, 1);
+  Serial.printf("%-12s : %lu\n", "Gerakan PIR", (unsigned long)(pirRiseCount - pirCountBase));
   Serial.printf("%-12s : %d (%s)\n", "fault (pred)", data.fault, data.label);
   Serial.printf("%-12s : %u -> %s\n", "semua aktif", data.faultMask, maskLabels(data.faultMask).c_str());
   Serial.printf("%-12s : %d (%s)\n", "gt_fault",     injectedFault, getAnomalyLabel((AnomalyCode)injectedFault));
@@ -1545,13 +1548,14 @@ uint8_t xorChecksum(const String &s) {
 }
 
 // Format Paket LoRa tetap identik dengan sistem penerima:
-// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc*CS
+// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC1,NTC2,NTC3,NTC4,NTC5,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc,pir_cnt*CS
 // fault_mask: bit k = kode anomali k aktif (dashboard: (mask >> k) & 1)
 void loraSend() {
   if (!loraCfgOk) { consecutiveLoraTimeout++; return; }   // jangan memancar dengan parameter yang belum terbukti
   txSeq++;
   String p = "AUR," + String(txSeq) + "," + buildLoraRow();   // rata-rata 5 s
   addField(p, !isnan(socPct), socPct, 1);                     // soc (%) di akhir payload
+  p += "," + String((unsigned long)(pirRiseCount - pirCountBase));             // pir_cnt (jumlah gerakan sejak boot)
 
   char tail[6];
   snprintf(tail, sizeof(tail), "*%02X", xorChecksum(p));
@@ -1704,6 +1708,7 @@ void handleSerial() {
   }
   else if (in.equalsIgnoreCase("header")) printCsvHeader();
   else if (in.equalsIgnoreCase("s")) scanI2C();
+  else if (in.equalsIgnoreCase("pr")) { pirCountBase = pirRiseCount; Serial.println(F("# Hitungan gerakan PIR direset ke 0")); }
   else if (in.equalsIgnoreCase("t")) startToggleMode();
   else if (in.equalsIgnoreCase("d")) startSweepMode();
   else if (in.equalsIgnoreCase("a1") || in.equalsIgnoreCase("lux")) startAdaptiveLuxMode();
