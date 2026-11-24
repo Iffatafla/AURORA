@@ -98,7 +98,8 @@ enum DimMode {
   MODE_SWEEP        = 2, // Sweep 0% <-> 100%
   MODE_ADAPTIVE_SIM = 3, // Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)
   MODE_ADAPTIVE_LUX = 4, // Adaptive TANPA PIR (murni berdasarkan BH1750 Ambient lux_amb)
-  MODE_ADAPTIVE_PIR = 5  // Adaptive DENGAN PIR (berdasarkan BH1750 Ambient + gerakan PIR)
+  MODE_ADAPTIVE_PIR = 5, // Adaptive DENGAN PIR (berdasarkan BH1750 Ambient + gerakan PIR)
+  MODE_CLOSED_LOOP  = 6  // Kendali daya closed-loop + derating suhu NTC3 (perintah clNN)
 };
 
 DimMode  currentDimMode = MODE_MANUAL_PWM;
@@ -482,7 +483,7 @@ void applyFaultInjection() {
 void evaluateAnomalyLayers() {
   // Deteksi apakah PWM sedang proses transisi (Soft-Ramp) atau baru saja berubah
   bool isRamping   = (hplPercent != targetPercent);
-  bool dutyChanged = (prevDutyKF >= 0.0f && fabs(data.duty - prevDutyKF) >= 1.0f) || isRamping;
+  bool dutyChanged = (prevDutyKF >= 0.0f && fabs(data.duty - prevDutyKF) > 1.5f) || isRamping;   // langkah 1% (closed-loop) bukan transisi
   prevDutyKF = data.duty;
 
   if (dutyChanged) {
@@ -561,9 +562,9 @@ void evaluateAnomalyLayers() {
     else { float u[1] = {data.mainV}; ssLoadOff.push(txMask ? NAN : data.mainA, u); }
   }
   {   // lamp_light: aktif duty >= 0.05 (butuh lux lampu & lux lingkungan valid)
-    bool act = lampValid && ambValid && dutyF >= 0.05f;
+    bool act = lampValid && dutyF >= 0.05f;
     if (!act) { ssLamp.reset(); flatLamp.reset(); }
-    else { float u[2] = {dutyF, data.lux[0]}; flatLamp.update(data.lux[1]); ssLamp.push(data.lux[1], u); }
+    else { float u[LAMP_LIGHT_NU] = {dutyF}; flatLamp.update(data.lux[1]); ssLamp.push(data.lux[1], u); }
   }
   {   // battery: aktif V_main > 5
     bool act = battValid && mainValid && data.mainV > 5.0f;
@@ -669,15 +670,28 @@ void evaluateAnomalyLayers() {
     raise(LOAD_LEAKAGE);
 
   // 2. Beban & lampu saat menyala stabil (duty >= 5% dan soft-ramp selesai). Sama dengan run_all.py
-  if (rampSettlingSamples == 0 && data.duty >= 5.0f) {
-    // Model load teridentifikasi + batas rasio kasar (cadangan untuk kegagalan besar)
-    if (mainValid && (ssLoad.flag || flatLoad.flag
-                      || data.mainW < (0.35f * expMainP) || data.mainW > (1.60f * expMainP)))
-      raise(LOAD_FAULT);
-    // Lampu: cahaya LEBIH RENDAH dari prediksi (atau sensor lux lampu beku), padahal daya normal
-    if (lampValid && ((ssLamp.flag && ssLamp.kf.nu < 0.0f) || flatLamp.flag || data.lux[1] < (0.25f * expLuxLamp)))
-      raise(LAMP_FAULT);
+  //    Dibuat LONGGAR (4 Nov): ambang NIS 1.5x val, 10 sampel berturut-turut, batas rasio lebar,
+  //    dan HISTERESIS: alarm baru dilepas setelah FAULT_RELEASE_N detik berturut-turut normal.
+  const int FAULT_RATIO_N   = 10;   // detik berturut-turut untuk aturan rasio
+  const int FAULT_RELEASE_N = 10;   // detik normal berturut-turut sebelum alarm dilepas
+  static int  loadRatioCnt = 0, lampRatioCnt = 0, loadGoodCnt = 0, lampGoodCnt = 0;
+  static bool loadLatch = false, lampLatch = false;
+  if (data.duty < 5.0f) {                       // lampu mati: tidak ada fault beban/lampu
+    loadLatch = lampLatch = false; loadRatioCnt = lampRatioCnt = loadGoodCnt = lampGoodCnt = 0;
+  } else if (rampSettlingSamples == 0) {        // saat transisi soft-ramp: status dipertahankan
+    bool loadRatio = mainValid && (data.mainW < (0.25f * expMainP) || data.mainW > (2.0f * expMainP));
+    bool lampRatio = lampValid && data.lux[1] < (0.15f * expLuxLamp);
+    loadRatioCnt = loadRatio ? loadRatioCnt + 1 : 0;
+    lampRatioCnt = lampRatio ? lampRatioCnt + 1 : 0;
+    bool loadRaw = mainValid && (ssLoad.flag || flatLoad.flag || loadRatioCnt >= FAULT_RATIO_N);
+    bool lampRaw = lampValid && ((ssLamp.flag && ssLamp.kf.nu < 0.0f) || flatLamp.flag || lampRatioCnt >= FAULT_RATIO_N);
+    if (loadRaw) { loadLatch = true; loadGoodCnt = 0; }
+    else if (loadLatch && ++loadGoodCnt >= FAULT_RELEASE_N) loadLatch = false;
+    if (lampRaw) { lampLatch = true; lampGoodCnt = 0; }
+    else if (lampLatch && ++lampGoodCnt >= FAULT_RELEASE_N) lampLatch = false;
   }
+  if (loadLatch) raise(LOAD_FAULT);
+  if (lampLatch) raise(LAMP_FAULT);
 
   // 3. PV pada siang hari
   // Model PV statis: P_pv_exp = k*lux + c. Dilewati saat SCC menahan arus (isFloatFull) dan saat
@@ -1198,6 +1212,53 @@ void startAdaptiveLuxMode() {
   }
 }
 
+// ---------------------------------------------------------------------
+// Kendali daya closed-loop (perintah 'clNN', mis. cl12 = target 12 W daya LAMPU = P_main - idle)
+//  - tiap 5 s duty dikoreksi maks +-1 % (pelan, agar model Kalman beban tetap valid)
+//  - suhu lampu NTC3 didahulukan: >=55 C target diturunkan linear (-50 % di 65 C),
+//    >=65 C duty ke standby; NTC3 tidak terbaca -> closed-loop dimatikan
+//  - duty dibatasi DUTY_MAX. Yang dikendalikan daya RATA-RATA (PWM), bukan arus puncak.
+// ---------------------------------------------------------------------
+const uint32_t CL_PERIOD_MS = 5000;
+const float    CL_T_DERATE  = 55.0f, CL_T_CUT = 65.0f;
+float    clTargetW = 0.0f;
+int      clDuty = 0;
+uint32_t clLastMs = 0;
+
+void startClosedLoop(float targetW) {
+  if (isnan(data.ntcT[NTC_CTRL_INDEX])) {
+    Serial.println(F("# CL DITOLAK: NTC3 (suhu lampu) tidak terbaca, closed-loop butuh pengaman suhu"));
+    return;
+  }
+  clTargetW = constrain(targetW, 1.0f, 40.0f);
+  clDuty = hplPercent > 0 ? hplPercent : standbyDuty;
+  currentDimMode = MODE_CLOSED_LOOP;
+  targetPercent = clDuty;
+  clLastMs = millis();
+  Serial.printf("# CL AKTIF: target daya lampu %.1f W (maks duty %d%%). Ketik angka/mode lain untuk keluar\n", clTargetW, DUTY_MAX);
+}
+
+void updateClosedLoop() {
+  if (millis() - clLastMs < CL_PERIOD_MS) return;
+  clLastMs = millis();
+  float T = data.ntcT[NTC_CTRL_INDEX];
+  if (isnan(T)) {
+    Serial.println(F("# CL BERHENTI: NTC3 hilang -> kembali ke duty standby manual"));
+    setManualPWM(standbyDuty);
+    return;
+  }
+  if (T >= CL_T_CUT) { clDuty = standbyDuty; targetPercent = clDuty; return; }
+  float tgt = clTargetW;
+  if (T > CL_T_DERATE) tgt *= 1.0f - 0.5f * (T - CL_T_DERATE) / (CL_T_CUT - CL_T_DERATE);
+  if (!data.mainOk || isnan(data.mainW)) return;
+  float pLamp = data.mainW - P_MAIN_IDLE_W;
+  float err = tgt - pLamp;
+  if (err > 0.3f)       clDuty += 1;            // deadband 0.3 W, langkah 1 %
+  else if (err < -0.3f) clDuty -= 1;
+  clDuty = constrain(clDuty, 0, DUTY_MAX);
+  targetPercent = clDuty;
+}
+
 void startAdaptivePirMode() {
   currentDimMode   = MODE_ADAPTIVE_PIR;
   lastSeenPirCount = pirRiseCount;
@@ -1633,6 +1694,8 @@ void printHelp() {
   Serial.println(F("#  + / -    : Naikkan / turunkan Duty Cycle sebesar 5%"));
   Serial.println(F("#  a1 / lux : Mode Adaptive TANPA PIR (Hanya mengandalkan BH1750 Ambient)"));
   Serial.println(F("#  a2 / pir : Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)"));
+  Serial.println(F("#  clNN     : Kendali daya closed-loop, mis. cl12 = lampu 12 W (butuh NTC3)"));
+  Serial.println(F("#  pr       : Reset hitungan gerakan PIR"));
   Serial.println(F("#  a        : Mode Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)"));
   Serial.println(F("#  d        : Mode Tes Auto-Sweep Dimming (0% <-> 100%)"));
   Serial.println(F("#  t        : Mode Toggle ON/OFF (0% <-> 100%) tiap 3 detik"));
@@ -1705,6 +1768,7 @@ void handleSerial() {
   }
   else if (in.equalsIgnoreCase("header")) printCsvHeader();
   else if (in.equalsIgnoreCase("s")) scanI2C();
+  else if ((in.startsWith("cl") || in.startsWith("CL")) && in.length() > 2) startClosedLoop(in.substring(2).toFloat());
   else if (in.equalsIgnoreCase("pr")) { pirCountBase = pirRiseCount; Serial.println(F("# Hitungan gerakan PIR direset ke 0")); }
   else if (in.equalsIgnoreCase("t")) startToggleMode();
   else if (in.equalsIgnoreCase("d")) startSweepMode();
@@ -1824,6 +1888,13 @@ void loop() {
   } else if (currentDimMode == MODE_ADAPTIVE_LUX) {
     // Mode Adaptive TANPA PIR (Hanya mengandalkan sensor BH1750 Ambient / data.lux[0])
     targetPercent = computeLuxOnlyTarget(data.lux[0]);
+    if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
+      lastRampStep = millis();
+      if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
+      else                            applySyncedPWM(max(hplPercent - RAMP_STEP_PCT, targetPercent));
+    }
+  } else if (currentDimMode == MODE_CLOSED_LOOP) {
+    updateClosedLoop();
     if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
       lastRampStep = millis();
       if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
