@@ -758,6 +758,35 @@ void evaluateAnomalyLayers() {
 
   // 6. Kegagalan komunikasi LoRa
   if (consecutiveLoraTimeout >= 3) raise(COMMUNICATION_FAULT);
+
+  // ===================================================================
+  // HISTERESIS LABEL (semua kode): setiap anomali yang pernah aktif DITAHAN minimal
+  // LABEL_HOLD_S detik setelah kondisi terakhir terpenuhi, agar label tidak berkedip
+  // (NONE <-> fault tiap detik). Kode yang sudah punya histeresis sendiri (L2, LOAD,
+  // LAMP, THERMAL_ABNORMAL) tetap ikut ditahan, jadi pelepasannya paling cepat 10 s.
+  // Kode utama dihitung ulang dari mask dengan urutan prioritas L2 > L1 > L3/L4.
+  // ===================================================================
+  // PERSISTENCE (tunda-nyala) untuk kode yang sebelumnya langsung aktif dari 1 sampel:
+  // sensor gagal baca (L1) dan batas absolut kebocoran arus. Harus 3 sampel berturut-turut.
+  // Kode lain sudah punya persistensi sendiri (L2: 3 sampel, LOAD/LAMP: 10 s, PV: 5, dst.).
+  const int PERSIST_ON_N = 3;
+  static const uint8_t PERSIST_CODES[] = {PV_SENSOR_FAULT, LOAD_LEAKAGE, LIGHT_SENSOR_FAULT, THERMAL_ABNORMAL, COMMUNICATION_DATA_INVALID};
+  static uint8_t onCnt[15] = {0};
+  for (uint8_t c : PERSIST_CODES) {
+    if (data.faultMask & (1u << c)) { if (onCnt[c] < 255) onCnt[c]++; }
+    else onCnt[c] = 0;
+    if (onCnt[c] < PERSIST_ON_N) data.faultMask &= (uint16_t)~(1u << c);
+  }
+
+  const int LABEL_HOLD_S = 10;
+  static uint8_t holdLeft[15] = {0};
+  for (int c = 1; c <= 14; c++) {
+    if (data.faultMask & (1u << c)) holdLeft[c] = LABEL_HOLD_S;
+    else if (holdLeft[c] > 0) { holdLeft[c]--; data.faultMask |= (uint16_t)(1u << c); }
+  }
+  static const uint8_t PRIO[] = {12, 6, 4, 3, 14, 2, 10, 9, 8, 7, 1, 5, 11, 13};
+  data.fault = NONE; data.label = getAnomalyLabel(NONE);
+  for (uint8_t c : PRIO) if (data.faultMask & (1u << c)) { data.fault = c; data.label = getAnomalyLabel((AnomalyCode)c); break; }
 }
 
 // =====================================================================
@@ -1030,6 +1059,7 @@ String maskLabels(uint16_t m) {
 // ---------------------------------------------------------------------
 const float BATT_CAP_AH = 12.0f;               // 4S2P, 12 Ah
 float    socPct   = NAN;
+bool     socShow  = false;   // SOC belum tervalidasi -> default TIDAK ditampilkan/dikirim (perintah 'soc' untuk ganti)
 uint32_t lastSocMs = 0;
 
 float socFromOcv(float v) {                     // tegangan istirahat pack 4S -> SOC (%)
@@ -1145,7 +1175,7 @@ void printCsvSerial() {
   line += "," + String(injectedFault);
   line += "," + String(getAnomalyLabel((AnomalyCode)injectedFault));
   line += String(",") + (data.loraTx ? "1" : "0");   // lora_tx
-  addField(line, !isnan(socPct), socPct, 1);          // soc (%)
+  addField(line, socShow && !isnan(socPct), socPct, 1);   // soc (%) - NA bila tampilan SOC mati
   line += "," + String((unsigned long)(pirRiseCount - pirCountBase));  // pir_cnt: jumlah gerakan terdeteksi sejak boot
   Serial.println(line);
 }
@@ -1174,7 +1204,7 @@ void printAll() {
   printFloatField("lux_amb",  data.bhOk[0], data.lux[0], 1);
   printFloatField("lux_lamp", data.bhOk[1], data.lux[1], 1);
   Serial.printf("%-12s : %d\n", "PIR",      data.pir);
-  printFloatField("SOC (%)",  !isnan(socPct), socPct, 1);
+  if (socShow) printFloatField("SOC (%)",  !isnan(socPct), socPct, 1);
   Serial.printf("%-12s : %lu\n", "Gerakan PIR", (unsigned long)(pirRiseCount - pirCountBase));
   Serial.printf("%-12s : %d (%s)\n", "fault (pred)", data.fault, data.label);
   Serial.printf("%-12s : %u -> %s\n", "semua aktif", data.faultMask, maskLabels(data.faultMask).c_str());
@@ -1701,7 +1731,7 @@ void loraSend() {
   if (!loraCfgOk) { consecutiveLoraTimeout++; return; }   // jangan memancar dengan parameter yang belum terbukti
   txSeq++;
   String p = "AUR," + String(txSeq) + "," + buildLoraRow();   // rata-rata 5 s
-  addField(p, !isnan(socPct), socPct, 1);                     // soc (%) di akhir payload
+  addField(p, socShow && !isnan(socPct), socPct, 1);          // soc (%) - NA bila tampilan SOC mati (format payload tetap)
   p += "," + String((unsigned long)(pirRiseCount - pirCountBase));             // pir_cnt (jumlah gerakan sejak boot)
 
   char tail[6];
@@ -1787,6 +1817,7 @@ void printHelp() {
   Serial.println(F("#  sp1=W / sp2=W / sp3=W : ubah setpoint standby / cooldown / gerakan, mis. sp3=20"));
   Serial.println(F("#  clNN     : Kendali daya closed-loop tetap, mis. cl12 = lampu 12 W (butuh NTC3)"));
   Serial.println(F("#  pr       : Reset hitungan gerakan PIR"));
+  Serial.println(F("#  soc      : Tampilkan / sembunyikan SOC (default: sembunyi, kolom berisi NA)"));
   Serial.println(F("#  a        : Mode Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)"));
   Serial.println(F("#  d        : Mode Tes Auto-Sweep Dimming (0% <-> 100%)"));
   Serial.println(F("#  t        : Mode Toggle ON/OFF (0% <-> 100%) tiap 3 detik"));
@@ -1860,6 +1891,7 @@ void handleSerial() {
   else if (in.equalsIgnoreCase("header")) printCsvHeader();
   else if (in.equalsIgnoreCase("s")) scanI2C();
   else if ((in.startsWith("cl") || in.startsWith("CL")) && in.length() > 2) startClosedLoop(in.substring(2).toFloat());
+  else if (in.equalsIgnoreCase("soc")) { socShow = !socShow; Serial.printf("# Tampilan SOC: %s\n", socShow ? "ON" : "OFF (dikirim NA)"); }
   else if (in.equalsIgnoreCase("pr")) { pirCountBase = pirRiseCount; Serial.println(F("# Hitungan gerakan PIR direset ke 0")); }
   else if (in.equalsIgnoreCase("t")) startToggleMode();
   else if (in.equalsIgnoreCase("d")) startSweepMode();
