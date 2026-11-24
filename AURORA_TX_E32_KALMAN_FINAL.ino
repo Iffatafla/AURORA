@@ -120,6 +120,22 @@ bool     pirMotionActive = false;
 // Batas duty maksimum demi keamanan lampu/driver (CC driver U8 tidak membatasi arus).
 // SEMUA mode & sesi dibatasi ke nilai ini. Catatan: PWM hanya menurunkan daya RATA-RATA;
 // arus puncak tetap dibatasi oleh setelan CV U8.
+// =====================================================================
+//   PENGATURAN CLOSED-LOOP (UBAH DI SINI SAJA) - dipakai mode a3 (PIR + closed-loop)
+// =====================================================================
+// Setpoint daya P_main [W] untuk tiap keadaan lampu. Bisa juga diubah saat jalan lewat Serial:
+//   sp1=7   (standby)   sp2=12  (cooldown setelah gerakan)   sp3=20  (ada gerakan)
+float SP_STANDBY_W  = 6.5f;    // tanpa gerakan (level standby)
+float SP_COOLDOWN_W = 11.0f;   // 4 s setelah gerakan
+float SP_MOTION_W   = 20.0f;   // ada gerakan
+const int   CL_DUTY_LIMIT   = 70;     // duty PWM maksimum yang boleh dipakai closed-loop [%]
+const float CL_T_SOFT_START = 50.0f;  // mulai turunkan daya bertahap [C, NTC3 suhu lampu]
+const float CL_T_SOFT_END   = 65.0f;  // di suhu ini setpoint tinggal CL_T_MIN_FRAC
+const float CL_T_MIN_FRAC   = 0.40f;  // fraksi setpoint minimum saat panas
+const float CL_T_CUTOFF     = 70.0f;  // >= ini: lampu ke standby (sama dengan batas L2)
+const float CL_DERATE_RATE  = 0.01f;  // perubahan faktor derating maks per detik (perlahan)
+// =====================================================================
+
 const int DUTY_MAX = 40;   // uji 1 Nov: >40% lampu mati (proteksi trip), 40% ~27 W P_main
 // Duty standby (mode PIR, tanpa gerakan, malam).
 const int standbyDuty = 10; // ~7 W P_main (uji 1 Nov)
@@ -1167,7 +1183,9 @@ void printAll() {
 //         Aktuator: Sinkronisasi Penuh LED HPL (Q3) & LED Internal
 // =====================================================================
 void applySyncedPWM(int pct) {
-  hplPercent    = constrain(pct, 0, DUTY_MAX);
+  // Batas duty: DUTY_MAX untuk semua mode, kecuali closed-loop (boleh sampai CL_DUTY_LIMIT)
+  bool clMode   = (currentDimMode == MODE_CLOSED_LOOP || currentDimMode == MODE_PIR_CL);
+  hplPercent    = constrain(pct, 0, clMode ? max(DUTY_MAX, CL_DUTY_LIMIT) : DUTY_MAX);
   currentPwmRaw = ((uint32_t)hplPercent * PWM_MAX) / 100;
 
   ledcWrite(PIN_PWM_HPL, currentPwmRaw);
@@ -1232,7 +1250,7 @@ void startAdaptiveLuxMode() {
 //  - duty dibatasi DUTY_MAX. Yang dikendalikan daya RATA-RATA (PWM), bukan arus puncak.
 // ---------------------------------------------------------------------
 const uint32_t CL_PERIOD_MS = 5000;
-const float    CL_T_DERATE  = 55.0f, CL_T_CUT = 65.0f;
+const float    CL_T_DERATE  = CL_T_SOFT_START, CL_T_CUT = CL_T_CUTOFF;
 float    clTargetW = 0.0f;
 int      clDuty = 0;
 uint32_t clLastMs = 0;
@@ -1267,7 +1285,7 @@ void updateClosedLoop() {
   float err = tgt - pLamp;
   if (err > 0.3f)       clDuty += 1;            // deadband 0.3 W, langkah 1 %
   else if (err < -0.3f) clDuty -= 1;
-  clDuty = constrain(clDuty, 0, DUTY_MAX);
+  clDuty = constrain(clDuty, 0, CL_DUTY_LIMIT);
   targetPercent = clDuty;
 }
 
@@ -1278,28 +1296,39 @@ void updateClosedLoop() {
 // Koreksi berbentuk pengali (clMul) karena penurunan daya akibat panas bersifat proporsional.
 // Pengaman suhu NTC3 sama dengan clNN: >=55 C acuan diturunkan, >=65 C ke standby, NTC3 NA -> tanpa CL.
 // ---------------------------------------------------------------------
-const int CL_DUTY_LIMIT = DUTY_MAX;   // duty PWM maksimum yang boleh dipakai closed-loop
-float clMul = 1.0f;                   // pengali koreksi, dibatasi 0.7..1.6
+float clMul = 1.0f;                   // pengali koreksi duty (duty_pwm = level x clMul)
+float clDerate = 1.0f;                // faktor derating suhu, berubah perlahan
 float lastClSampleT = -1.0f;
 
-float clRefPowerW(int level) {        // daya P_main acuan untuk level duty (linear di antara titik)
+// Setpoint menurut level yang dipilih logika PIR: 0 = mati, standbyDuty = standby, 20 = cooldown, DUTY_MAX = gerakan
+float clSetpointW(int level) {
   if (level <= 0) return 0.0f;
-  if (level < 10) return 1.7f + (6.5f - 1.7f) * level / 10.0f;
-  return 6.5f + (level - 10) * (20.0f - 6.5f) / 30.0f;
+  if (level >= DUTY_MAX)    return SP_MOTION_W;
+  if (level > standbyDuty)  return SP_COOLDOWN_W;
+  return SP_STANDBY_W;
 }
 
 int pirClDuty(int level) {
-  if (level <= 0) { return 0; }
+  if (level <= 0) return 0;
   float T = data.ntcT[NTC_CTRL_INDEX];
-  if (isnan(T)) { clMul = 1.0f; return level; }                 // tanpa sensor suhu: open-loop
-  if (T >= CL_T_CUT) { clMul = 1.0f; return min(level, standbyDuty); }
-  float ref = clRefPowerW(level);
-  if (T > CL_T_DERATE) ref = 1.7f + (ref - 1.7f) * (1.0f - 0.5f * (T - CL_T_DERATE) / (CL_T_CUT - CL_T_DERATE));
-  if (data.t != lastClSampleT && data.mainOk && !isnan(data.mainW) && hplPercent == targetPercent) {
-    lastClSampleT = data.t;                                       // satu koreksi per sampel 1 Hz, saat duty sudah stabil
-    float err = ref - data.mainW;
-    if (fabs(err) > 0.5f) clMul *= 1.0f + constrain(0.04f * err / ref, -0.03f, 0.03f);
-    clMul = constrain(clMul, 0.7f, 1.6f);
+  if (isnan(T)) { clMul = 1.0f; clDerate = 1.0f; return level; }      // tanpa sensor suhu: open-loop, duty level biasa
+  if (T >= CL_T_CUTOFF) { clDerate = CL_T_MIN_FRAC; return min(level, standbyDuty); }
+  if (data.t != lastClSampleT) {                                       // satu koreksi per sampel 1 Hz
+    lastClSampleT = data.t;
+    // derating suhu: target faktor turun linear 1 -> CL_T_MIN_FRAC antara 50 dan 65 C, diubah perlahan
+    float want = 1.0f;
+    if (T > CL_T_SOFT_START)
+      want = 1.0f - (1.0f - CL_T_MIN_FRAC) * min(1.0f, (T - CL_T_SOFT_START) / (CL_T_SOFT_END - CL_T_SOFT_START));
+    clDerate += constrain(want - clDerate, -CL_DERATE_RATE, CL_DERATE_RATE);
+    float ref = 1.7f + (clSetpointW(level) - 1.7f) * clDerate;        // 1.7 W = konsumsi board
+    // sensor cahaya lampu: bila lampu/beban dinyatakan rusak, JANGAN memaksa daya naik
+    bool lampBad = (data.faultMask & ((1u << LAMP_FAULT) | (1u << LOAD_FAULT))) != 0;
+    if (data.mainOk && !isnan(data.mainW) && hplPercent == targetPercent) {
+      float err = ref - data.mainW;
+      if (lampBad && err > 0) err = 0;
+      if (fabs(err) > 0.5f) clMul *= 1.0f + constrain(0.04f * err / ref, -0.03f, 0.03f);
+    }
+    clMul = constrain(clMul, 0.3f, (float)CL_DUTY_LIMIT / level);
   }
   return constrain((int)lroundf(level * clMul), 0, CL_DUTY_LIMIT);
 }
@@ -1308,7 +1337,8 @@ void startPirClMode() {
   startAdaptivePirMode();
   currentDimMode = MODE_PIR_CL;
   clMul = 1.0f;
-  Serial.println(F("# MODE a3: PIR + closed-loop (10%~6.5 W, 20%~11 W, 40%~20 W). a2 = PIR tanpa closed-loop"));
+  Serial.printf("# MODE a3: PIR + closed-loop. Setpoint standby %.1f W, cooldown %.1f W, gerakan %.1f W (duty maks %d%%)\n", SP_STANDBY_W, SP_COOLDOWN_W, SP_MOTION_W, CL_DUTY_LIMIT);
+  clDerate = 1.0f;
   if (isnan(data.ntcT[NTC_CTRL_INDEX])) Serial.println(F("# PERINGATAN: NTC3 tidak terbaca -> closed-loop nonaktif (open-loop) sampai sensor terbaca"));
 }
 
@@ -1747,7 +1777,8 @@ void printHelp() {
   Serial.println(F("#  + / -    : Naikkan / turunkan Duty Cycle sebesar 5%"));
   Serial.println(F("#  a1 / lux : Mode Adaptive TANPA PIR (Hanya mengandalkan BH1750 Ambient)"));
   Serial.println(F("#  a2 / pir : Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)"));
-  Serial.println(F("#  a3/pircl : Mode Adaptive PIR + closed-loop daya (10%~6.5 W ... 40%~20 W)"));
+  Serial.println(F("#  a3/pircl : Mode Adaptive PIR + closed-loop daya (setpoint di bagian PENGATURAN)"));
+  Serial.println(F("#  sp1=W / sp2=W / sp3=W : ubah setpoint standby / cooldown / gerakan, mis. sp3=20"));
   Serial.println(F("#  clNN     : Kendali daya closed-loop tetap, mis. cl12 = lampu 12 W (butuh NTC3)"));
   Serial.println(F("#  pr       : Reset hitungan gerakan PIR"));
   Serial.println(F("#  a        : Mode Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)"));
@@ -1829,6 +1860,11 @@ void handleSerial() {
   else if (in.equalsIgnoreCase("a1") || in.equalsIgnoreCase("lux")) startAdaptiveLuxMode();
   else if (in.equalsIgnoreCase("a2") || in.equalsIgnoreCase("pir")) startAdaptivePirMode();
   else if (in.equalsIgnoreCase("a3") || in.equalsIgnoreCase("pircl")) startPirClMode();
+  else if ((in.startsWith("sp1=") || in.startsWith("sp2=") || in.startsWith("sp3=")) && in.length() > 4) {
+    float w = constrain(in.substring(4).toFloat(), 0.0f, 40.0f);
+    if (in[2] == '1') SP_STANDBY_W = w; else if (in[2] == '2') SP_COOLDOWN_W = w; else SP_MOTION_W = w;
+    Serial.printf("# Setpoint: standby %.1f W | cooldown %.1f W | gerakan %.1f W\n", SP_STANDBY_W, SP_COOLDOWN_W, SP_MOTION_W);
+  }
   else if (in.equalsIgnoreCase("a")) startAdaptiveSimMode();
   else if (in.equalsIgnoreCase("fauto")) startAutoFaultTest();
   else if ((in.startsWith("f") || in.startsWith("F")) && isNumericString(in.substring(1))) {
