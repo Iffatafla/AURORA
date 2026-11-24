@@ -129,10 +129,10 @@ float SP_STANDBY_W  = 6.5f;    // tanpa gerakan (level standby)
 float SP_COOLDOWN_W = 11.0f;   // 4 s setelah gerakan
 float SP_MOTION_W   = 20.0f;   // ada gerakan
 const int   CL_DUTY_LIMIT   = 70;     // duty PWM maksimum yang boleh dipakai closed-loop [%]
-const float CL_T_SOFT_START = 50.0f;  // mulai turunkan daya bertahap [C, NTC3 suhu lampu]
-const float CL_T_SOFT_END   = 65.0f;  // di suhu ini setpoint tinggal CL_T_MIN_FRAC
+const float CL_T_SOFT_START = 45.0f;  // mulai turunkan daya bertahap [C, NTC3 suhu lampu] (lampu murah: 6 Nov)
+const float CL_T_SOFT_END   = 55.0f;  // di suhu ini setpoint tinggal CL_T_MIN_FRAC
 const float CL_T_MIN_FRAC   = 0.40f;  // fraksi setpoint minimum saat panas
-const float CL_T_CUTOFF     = 70.0f;  // >= ini: lampu ke standby (sama dengan batas L2)
+const float CL_T_CUTOFF     = 60.0f;  // >= ini: lampu ke standby
 const float CL_DERATE_RATE  = 0.01f;  // perubahan faktor derating maks per detik (perlahan)
 // =====================================================================
 
