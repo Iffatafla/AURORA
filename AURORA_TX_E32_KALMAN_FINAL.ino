@@ -124,16 +124,29 @@ bool     pirMotionActive = false;
 //   PENGATURAN CLOSED-LOOP (UBAH DI SINI SAJA) - dipakai mode a3 (PIR + closed-loop)
 // =====================================================================
 // Setpoint daya P_main [W] untuk tiap keadaan lampu. Bisa juga diubah saat jalan lewat Serial:
-//   sp1=7   (standby)   sp2=12  (cooldown setelah gerakan)   sp3=20  (ada gerakan)
+//   sp1=7   (standby)   sp2=12  (cooldown setelah gerakan)   sp3=25  (ada gerakan)
 float SP_STANDBY_W  = 6.5f;    // tanpa gerakan (level standby)
 float SP_COOLDOWN_W = 11.0f;   // 4 s setelah gerakan
-float SP_MOTION_W   = 20.0f;   // ada gerakan
+float SP_MOTION_W   = 25.0f;   // ada gerakan (orang lewat)
 const int   CL_DUTY_LIMIT   = 70;     // duty PWM maksimum yang boleh dipakai closed-loop [%]
 const float CL_T_SOFT_START = 45.0f;  // mulai turunkan daya bertahap [C, NTC3 suhu lampu] (lampu murah: 6 Nov)
 const float CL_T_SOFT_END   = 55.0f;  // di suhu ini setpoint tinggal CL_T_MIN_FRAC
 const float CL_T_MIN_FRAC   = 0.40f;  // fraksi setpoint minimum saat panas
 const float CL_T_CUTOFF     = 60.0f;  // >= ini: lampu ke standby
 const float CL_DERATE_RATE  = 0.01f;  // perubahan faktor derating maks per detik (perlahan)
+// ---------------------------------------------------------------------
+//   PEREDUPAN BERTAHAP BERBASIS TEGANGAN BATERAI (masukan penguji no. 2 & 6)
+// V_bat dirata-rata 60 s, hanya saat lampu menyala (tegangan berbeban).
+// Turun level bila rata-rata < BAT_DOWN_V[i]; naik lagi hanya bila > BAT_DOWN_V[i] + BAT_HYS_V.
+// Level: 0 normal 100% | 1 hemat 75% | 2 hemat 50% | 3 bertahan 25% | 4 mati terkendali
+// Angka ambang = perkiraan awal (BELUM divalidasi uji discharge). SCC putus beban di 11,2 V.
+const float BAT_DOWN_V[4]  = {12.9f, 12.6f, 12.2f, 11.6f};
+const float BAT_FRAC[5]    = {1.00f, 0.75f, 0.50f, 0.25f, 0.0f};
+const float BAT_HYS_V      = 0.3f;    // histeresis antar level (pengaman baterai, bukan label)
+const int   BAT_AVG_S      = 60;      // panjang rata-rata
+const float BAT_FAST_V     = 11.5f;   // rata-rata 10 s di bawah ini -> langsung level 4
+int   batLevel = 0;                   // level hemat aktif (dikirim sebagai bat_lvl)
+float batAvgV  = NAN;                 // rata-rata V_bat berbeban 60 s
 // =====================================================================
 
 const int DUTY_MAX = 40;   // uji 1 Nov: >40% lampu mati (proteksi trip), 40% ~27 W P_main
@@ -689,13 +702,12 @@ void evaluateAnomalyLayers() {
 
   // 2. Beban & lampu saat menyala stabil (duty >= 5% dan soft-ramp selesai). Sama dengan run_all.py
   //    Dibuat LONGGAR (4 Nov): ambang NIS 1.5x val, 10 sampel berturut-turut, batas rasio lebar,
-  //    dan HISTERESIS: alarm baru dilepas setelah FAULT_RELEASE_N detik berturut-turut normal.
-  const int FAULT_RATIO_N   = 10;   // detik berturut-turut untuk aturan rasio
-  const int FAULT_RELEASE_N = 10;   // detik normal berturut-turut sebelum alarm dilepas
-  static int  loadRatioCnt = 0, lampRatioCnt = 0, loadGoodCnt = 0, lampGoodCnt = 0;
+  //    Revisi 15 Nov: histeresis pelepasan DIHAPUS, alarm lepas begitu kondisinya hilang (persistence tetap).
+  const int FAULT_RATIO_N   = 10;   // detik berturut-turut untuk aturan rasio (persistence)
+  static int  loadRatioCnt = 0, lampRatioCnt = 0;
   static bool loadLatch = false, lampLatch = false;
   if (data.duty < 5.0f) {                       // lampu mati: tidak ada fault beban/lampu
-    loadLatch = lampLatch = false; loadRatioCnt = lampRatioCnt = loadGoodCnt = lampGoodCnt = 0;
+    loadLatch = lampLatch = false; loadRatioCnt = lampRatioCnt = 0;
   } else if (rampSettlingSamples == 0) {        // saat transisi soft-ramp: status dipertahankan
     // Revisi 5 Nov: batas rasio dari data 4 Nov (hardware sekarang): P_main ~ 1.7 W + 0.305 W per % duty,
     // lux_lamp ~ 10 lux per % duty. Duty di atas 40 % (closed-loop) dipotong ke 40 agar lampu panas tidak
@@ -709,10 +721,8 @@ void evaluateAnomalyLayers() {
     lampRatioCnt = lampRatio ? lampRatioCnt + 1 : 0;
     bool loadRaw = mainValid && (ssLoad.flag || flatLoad.flag || loadRatioCnt >= FAULT_RATIO_N);
     bool lampRaw = lampValid && ((ssLamp.flag && ssLamp.kf.nu < 0.0f) || flatLamp.flag || lampRatioCnt >= FAULT_RATIO_N);
-    if (loadRaw) { loadLatch = true; loadGoodCnt = 0; }
-    else if (loadLatch && ++loadGoodCnt >= FAULT_RELEASE_N) loadLatch = false;
-    if (lampRaw) { lampLatch = true; lampGoodCnt = 0; }
-    else if (lampLatch && ++lampGoodCnt >= FAULT_RELEASE_N) lampLatch = false;
+    loadLatch = loadRaw;
+    lampLatch = lampRaw;
   }
   if (loadLatch) raise(LOAD_FAULT);
   if (lampLatch) raise(LAMP_FAULT);
@@ -752,18 +762,14 @@ void evaluateAnomalyLayers() {
     tBuf[tHead] = tNtc3; tHead = (tHead + 1) % 60; if (tCnt < 60) tCnt++;
   }
   bool thermOn  = (!isnan(rate) && rate > 15.0f) || (!isnan(tNtc3) && tNtc3 >= 60.0f) || (!isnan(tLm75) && tLm75 >= 55.0f);
-  bool thermOff = (isnan(rate) || rate < 10.0f) && (isnan(tNtc3) || tNtc3 < 57.0f) && (isnan(tLm75) || tLm75 < 52.0f);
-  if (thermOn) thermLatch = true; else if (thermOff) thermLatch = false;
+  thermLatch = thermOn;   // revisi 15 Nov: tanpa histeresis pelepasan (persistence 3 s di bawah)
   if (thermLatch) raise(THERMAL_ABNORMAL);
 
   // 6. Kegagalan komunikasi LoRa
   if (consecutiveLoraTimeout >= 3) raise(COMMUNICATION_FAULT);
 
   // ===================================================================
-  // HISTERESIS LABEL (semua kode): setiap anomali yang pernah aktif DITAHAN minimal
-  // LABEL_HOLD_S detik setelah kondisi terakhir terpenuhi, agar label tidak berkedip
-  // (NONE <-> fault tiap detik). Kode yang sudah punya histeresis sendiri (L2, LOAD,
-  // LAMP, THERMAL_ABNORMAL) tetap ikut ditahan, jadi pelepasannya paling cepat 10 s.
+  // Histeresis label DIHAPUS (15 Nov). Yang dipakai hanya PERSISTENCE (tunda-nyala).
   // Kode utama dihitung ulang dari mask dengan urutan prioritas L2 > L1 > L3/L4.
   // ===================================================================
   // PERSISTENCE (tunda-nyala) untuk kode yang sebelumnya langsung aktif dari 1 sampel:
@@ -778,12 +784,6 @@ void evaluateAnomalyLayers() {
     if (onCnt[c] < PERSIST_ON_N) data.faultMask &= (uint16_t)~(1u << c);
   }
 
-  const int LABEL_HOLD_S = 10;
-  static uint8_t holdLeft[15] = {0};
-  for (int c = 1; c <= 14; c++) {
-    if (data.faultMask & (1u << c)) holdLeft[c] = LABEL_HOLD_S;
-    else if (holdLeft[c] > 0) { holdLeft[c]--; data.faultMask |= (uint16_t)(1u << c); }
-  }
   static const uint8_t PRIO[] = {12, 6, 4, 3, 14, 2, 10, 9, 8, 7, 1, 5, 11, 13};
   data.fault = NONE; data.label = getAnomalyLabel(NONE);
   for (uint8_t c : PRIO) if (data.faultMask & (1u << c)) { data.fault = c; data.label = getAnomalyLabel((AnomalyCode)c); break; }
@@ -1154,7 +1154,7 @@ String buildCsvRow() {
 
 // Cetak header CSV untuk mempermudah olah data di Excel / Python
 void printCsvHeader() {
-  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc,pir_cnt"));
+  Serial.println(F("t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,kf_Vbat,kf_Pmain,kf_Vpv,nis_batV,nis_mainP,nis_pvV,nis_temp,gt_fault,gt_label,lora_tx,soc,pir_cnt,bat_lvl"));
 }
 
 // Cetak baris CSV lengkap ke Serial Monitor (22 kolom utama + 7 kolom diagnostik Kalman/NIS + 2 kolom Ground Truth)
@@ -1177,6 +1177,7 @@ void printCsvSerial() {
   line += String(",") + (data.loraTx ? "1" : "0");   // lora_tx
   addField(line, socShow && !isnan(socPct), socPct, 1);   // soc (%) - NA bila tampilan SOC mati
   line += "," + String((unsigned long)(pirRiseCount - pirCountBase));  // pir_cnt: jumlah gerakan terdeteksi sejak boot
+  line += "," + String(batLevel);                                      // bat_lvl: 0 normal .. 4 mati terkendali
   Serial.println(line);
 }
 
@@ -1206,6 +1207,7 @@ void printAll() {
   Serial.printf("%-12s : %d\n", "PIR",      data.pir);
   if (socShow) printFloatField("SOC (%)",  !isnan(socPct), socPct, 1);
   Serial.printf("%-12s : %lu\n", "Gerakan PIR", (unsigned long)(pirRiseCount - pirCountBase));
+  Serial.printf("%-12s : %d (%.0f%%)  Vbat60s=%.2f V\n", "Level hemat", batLevel, BAT_FRAC[batLevel] * 100.0f, batAvgV);
   Serial.printf("%-12s : %d (%s)\n", "fault (pred)", data.fault, data.label);
   Serial.printf("%-12s : %u -> %s\n", "semua aktif", data.faultMask, maskLabels(data.faultMask).c_str());
   Serial.printf("%-12s : %d (%s)\n", "gt_fault",     injectedFault, getAnomalyLabel((AnomalyCode)injectedFault));
@@ -1336,6 +1338,34 @@ float clMul = 1.0f;                   // pengali koreksi duty (duty_pwm = level 
 float clDerate = 1.0f;                // faktor derating suhu, berubah perlahan
 float lastClSampleT = -1.0f;
 
+// ---- Peredupan bertahap berbasis tegangan baterai ----
+float batBuf[BAT_AVG_S]; int batN = 0, batIdx = 0;
+float lastBatSampleT = -1.0f;
+
+void updateBatLevel() {
+  if (data.t == lastBatSampleT) return;           // sekali per sampel 1 Hz
+  lastBatSampleT = data.t;
+  if (!data.battOk || isnan(data.battV)) return;   // sensor invalid: level dipertahankan
+  if (hplPercent <= 0) return;                     // hanya tegangan saat berbeban (siang/mati tidak dihitung)
+  batBuf[batIdx] = data.battV; batIdx = (batIdx + 1) % BAT_AVG_S; if (batN < BAT_AVG_S) batN++;
+  if (batN < 10) return;
+  float sum = 0, sum10 = 0;
+  for (int i = 0; i < batN; i++) sum += batBuf[i];
+  for (int i = 0; i < 10; i++) sum10 += batBuf[(batIdx - 1 - i + BAT_AVG_S) % BAT_AVG_S];
+  batAvgV = sum / batN;
+  if (sum10 / 10.0f < BAT_FAST_V) { batLevel = 4; return; }   // jalur cepat dekat LVD SCC
+  if (batN < BAT_AVG_S) return;                                 // level normal perlu 60 s penuh
+  int want = 0;
+  for (int i = 0; i < 4; i++) if (batAvgV < BAT_DOWN_V[i]) want = i + 1;
+  if (want > batLevel) batLevel = want;                         // turun level langsung
+  else if (want < batLevel && batAvgV > BAT_DOWN_V[batLevel - 1] + BAT_HYS_V) batLevel--;  // naik satu level, dengan histeresis
+}
+
+// Siang (baterai diisi) mereset level setelah SCC mengisi: V_bat >= 13,4 V tanpa beban
+void batLevelDayReset() {
+  if (hplPercent == 0 && data.battOk && data.battV >= 13.4f && batLevel > 0) { batLevel = 0; batN = 0; batIdx = 0; }
+}
+
 // Setpoint menurut level yang dipilih logika PIR: 0 = mati, standbyDuty = standby, 20 = cooldown, DUTY_MAX = gerakan
 float clSetpointW(int level) {
   if (level <= 0) return 0.0f;
@@ -1346,6 +1376,7 @@ float clSetpointW(int level) {
 
 int pirClDuty(int level) {
   if (level <= 0) return 0;
+  if (batLevel >= 4) return 0;                                         // mati terkendali sebelum SCC memutus
   float T = data.ntcT[NTC_CTRL_INDEX];
   if (isnan(T)) { clMul = 1.0f; clDerate = 1.0f; return level; }      // tanpa sensor suhu: open-loop, duty level biasa
   if (T >= CL_T_CUTOFF) { clDerate = CL_T_MIN_FRAC; return min(level, standbyDuty); }
@@ -1356,7 +1387,7 @@ int pirClDuty(int level) {
     if (T > CL_T_SOFT_START)
       want = 1.0f - (1.0f - CL_T_MIN_FRAC) * min(1.0f, (T - CL_T_SOFT_START) / (CL_T_SOFT_END - CL_T_SOFT_START));
     clDerate += constrain(want - clDerate, -CL_DERATE_RATE, CL_DERATE_RATE);
-    float ref = 1.7f + (clSetpointW(level) - 1.7f) * clDerate;        // 1.7 W = konsumsi board
+    float ref = 1.7f + (clSetpointW(level) * BAT_FRAC[batLevel] - 1.7f) * clDerate;        // 1.7 W = konsumsi board
     // sensor cahaya lampu: bila lampu/beban dinyatakan rusak, JANGAN memaksa daya naik
     bool lampBad = (data.faultMask & ((1u << LAMP_FAULT) | (1u << LOAD_FAULT))) != 0;
     if (data.mainOk && !isnan(data.mainW) && hplPercent == targetPercent) {
@@ -1725,7 +1756,7 @@ uint8_t xorChecksum(const String &s) {
 }
 
 // Format Paket LoRa tetap identik dengan sistem penerima:
-// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc,pir_cnt*CS
+// AUR,seq,t,duty,V_main,I_main,P_main,V_pv,I_pv,P_pv,V_bat,I_bat,I_bat_sq,NTC3,T_LM75,lux_amb,lux_lamp,PIR,fault,label,fault_mask,soc,pir_cnt,bat_lvl*CS
 // fault_mask: bit k = kode anomali k aktif (dashboard: (mask >> k) & 1)
 void loraSend() {
   if (!loraCfgOk) { consecutiveLoraTimeout++; return; }   // jangan memancar dengan parameter yang belum terbukti
@@ -1733,6 +1764,7 @@ void loraSend() {
   String p = "AUR," + String(txSeq) + "," + buildLoraRow();   // rata-rata 5 s
   addField(p, socShow && !isnan(socPct), socPct, 1);          // soc (%) - NA bila tampilan SOC mati (format payload tetap)
   p += "," + String((unsigned long)(pirRiseCount - pirCountBase));             // pir_cnt (jumlah gerakan sejak boot)
+  p += "," + String(batLevel);                                                 // bat_lvl
 
   char tail[6];
   snprintf(tail, sizeof(tail), "*%02X", xorChecksum(p));
@@ -2032,7 +2064,9 @@ void loop() {
   } else if (currentDimMode == MODE_ADAPTIVE_PIR || currentDimMode == MODE_PIR_CL) {
     // Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR); a3: + closed-loop daya
     int level = computeLuxPirTarget(data.lux[0]);
-    targetPercent = (currentDimMode == MODE_PIR_CL) ? pirClDuty(level) : level;
+    updateBatLevel(); batLevelDayReset();
+    if (currentDimMode == MODE_PIR_CL) targetPercent = pirClDuty(level);
+    else targetPercent = (level > 0) ? (int)lroundf(level * BAT_FRAC[batLevel]) : 0;   // open-loop: duty diskalakan
     if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
       lastRampStep = millis();
       if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
