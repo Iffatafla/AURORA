@@ -34,6 +34,7 @@
 #include "params_battery.h"
 #include "params_pv_static.h"
 void updateSoc();   // deklarasi awal (definisi di dekat buildCsvRow)
+void startAdaptivePirMode();
 
 // ================= Pin =================
 const int PIN_SDA     = 21;
@@ -99,7 +100,8 @@ enum DimMode {
   MODE_ADAPTIVE_SIM = 3, // Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)
   MODE_ADAPTIVE_LUX = 4, // Adaptive TANPA PIR (murni berdasarkan BH1750 Ambient lux_amb)
   MODE_ADAPTIVE_PIR = 5, // Adaptive DENGAN PIR (berdasarkan BH1750 Ambient + gerakan PIR)
-  MODE_CLOSED_LOOP  = 6  // Kendali daya closed-loop + derating suhu NTC3 (perintah clNN)
+  MODE_CLOSED_LOOP  = 6, // Kendali daya closed-loop + derating suhu NTC3 (perintah clNN)
+  MODE_PIR_CL       = 7  // Adaptive PIR + closed-loop: tiap level duty dijaga pada daya acuannya (a3)
 };
 
 DimMode  currentDimMode = MODE_MANUAL_PWM;
@@ -717,10 +719,20 @@ void evaluateAnomalyLayers() {
     raise(BATTERY_ABNORMAL);
 
   // 5. Dinamika termal (kenaikan mendadak NTC #1, NTC #3, atau LM75B)
-  bool batThermalSpike  = (kfTempBat.initialized  && kfTempBat.nis  > NIS_THRESHOLD && kfTempBat.nu  > 0.0f);
-  bool ntc3ThermalSpike = (kfTempNtc3.initialized && kfTempNtc3.nis > NIS_THRESHOLD && kfTempNtc3.nu > 0.0f);
-  bool lm75ThermalSpike = (kfTempLm75.initialized && kfTempLm75.nis > NIS_THRESHOLD && kfTempLm75.nu > 0.0f);
-  if (batThermalSpike || ntc3ThermalSpike || lm75ThermalSpike) raise(THERMAL_ABNORMAL);
+  // Revisi 4 Nov: NIS dummy terlalu sensitif (pemanasan lampu normal dianggap anomali).
+  // Data 4 Nov: kenaikan NTC3 normal maks 9.3 C/menit (jendela 60 s), suhu maks 55 C.
+  // THERMAL_ABNORMAL bila: laju naik NTC3 > 15 C/menit, ATAU NTC3 >= 60 C (peringatan sebelum
+  // batas 70 C), ATAU suhu board LM75 >= 55 C. Dilepas dengan histeresis (laju < 10 C/menit, NTC3 < 57 C).
+  static float tBuf[60]; static int tHead = 0, tCnt = 0; static bool thermLatch = false;
+  float rate = NAN;
+  if (!isnan(tNtc3)) {
+    if (tCnt == 60) rate = tNtc3 - tBuf[tHead];         // kenaikan selama 60 s (C/menit)
+    tBuf[tHead] = tNtc3; tHead = (tHead + 1) % 60; if (tCnt < 60) tCnt++;
+  }
+  bool thermOn  = (!isnan(rate) && rate > 15.0f) || (!isnan(tNtc3) && tNtc3 >= 60.0f) || (!isnan(tLm75) && tLm75 >= 55.0f);
+  bool thermOff = (isnan(rate) || rate < 10.0f) && (isnan(tNtc3) || tNtc3 < 57.0f) && (isnan(tLm75) || tLm75 < 52.0f);
+  if (thermOn) thermLatch = true; else if (thermOff) thermLatch = false;
+  if (thermLatch) raise(THERMAL_ABNORMAL);
 
   // 6. Kegagalan komunikasi LoRa
   if (consecutiveLoraTimeout >= 3) raise(COMMUNICATION_FAULT);
@@ -1259,6 +1271,47 @@ void updateClosedLoop() {
   targetPercent = clDuty;
 }
 
+// ---------------------------------------------------------------------
+// Mode a3 = PIR + closed-loop. Logika PIR/cahaya memilih LEVEL duty (0/10/20/40 dst.), lalu
+// closed-loop mengatur duty PWM sebenarnya agar P_main mencapai daya acuan level tsb.
+// Acuan dari data 3 Nov (hardware normal/dingin): 10% -> 6.5 W, 20% -> 11 W, 30% -> 15.5 W, 40% -> 20 W.
+// Koreksi berbentuk pengali (clMul) karena penurunan daya akibat panas bersifat proporsional.
+// Pengaman suhu NTC3 sama dengan clNN: >=55 C acuan diturunkan, >=65 C ke standby, NTC3 NA -> tanpa CL.
+// ---------------------------------------------------------------------
+const int CL_DUTY_LIMIT = DUTY_MAX;   // duty PWM maksimum yang boleh dipakai closed-loop
+float clMul = 1.0f;                   // pengali koreksi, dibatasi 0.7..1.6
+float lastClSampleT = -1.0f;
+
+float clRefPowerW(int level) {        // daya P_main acuan untuk level duty (linear di antara titik)
+  if (level <= 0) return 0.0f;
+  if (level < 10) return 1.7f + (6.5f - 1.7f) * level / 10.0f;
+  return 6.5f + (level - 10) * (20.0f - 6.5f) / 30.0f;
+}
+
+int pirClDuty(int level) {
+  if (level <= 0) { return 0; }
+  float T = data.ntcT[NTC_CTRL_INDEX];
+  if (isnan(T)) { clMul = 1.0f; return level; }                 // tanpa sensor suhu: open-loop
+  if (T >= CL_T_CUT) { clMul = 1.0f; return min(level, standbyDuty); }
+  float ref = clRefPowerW(level);
+  if (T > CL_T_DERATE) ref = 1.7f + (ref - 1.7f) * (1.0f - 0.5f * (T - CL_T_DERATE) / (CL_T_CUT - CL_T_DERATE));
+  if (data.t != lastClSampleT && data.mainOk && !isnan(data.mainW) && hplPercent == targetPercent) {
+    lastClSampleT = data.t;                                       // satu koreksi per sampel 1 Hz, saat duty sudah stabil
+    float err = ref - data.mainW;
+    if (fabs(err) > 0.5f) clMul *= 1.0f + constrain(0.04f * err / ref, -0.03f, 0.03f);
+    clMul = constrain(clMul, 0.7f, 1.6f);
+  }
+  return constrain((int)lroundf(level * clMul), 0, CL_DUTY_LIMIT);
+}
+
+void startPirClMode() {
+  startAdaptivePirMode();
+  currentDimMode = MODE_PIR_CL;
+  clMul = 1.0f;
+  Serial.println(F("# MODE a3: PIR + closed-loop (10%~6.5 W, 20%~11 W, 40%~20 W). a2 = PIR tanpa closed-loop"));
+  if (isnan(data.ntcT[NTC_CTRL_INDEX])) Serial.println(F("# PERINGATAN: NTC3 tidak terbaca -> closed-loop nonaktif (open-loop) sampai sensor terbaca"));
+}
+
 void startAdaptivePirMode() {
   currentDimMode   = MODE_ADAPTIVE_PIR;
   lastSeenPirCount = pirRiseCount;
@@ -1694,7 +1747,8 @@ void printHelp() {
   Serial.println(F("#  + / -    : Naikkan / turunkan Duty Cycle sebesar 5%"));
   Serial.println(F("#  a1 / lux : Mode Adaptive TANPA PIR (Hanya mengandalkan BH1750 Ambient)"));
   Serial.println(F("#  a2 / pir : Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)"));
-  Serial.println(F("#  clNN     : Kendali daya closed-loop, mis. cl12 = lampu 12 W (butuh NTC3)"));
+  Serial.println(F("#  a3/pircl : Mode Adaptive PIR + closed-loop daya (10%~6.5 W ... 40%~20 W)"));
+  Serial.println(F("#  clNN     : Kendali daya closed-loop tetap, mis. cl12 = lampu 12 W (butuh NTC3)"));
   Serial.println(F("#  pr       : Reset hitungan gerakan PIR"));
   Serial.println(F("#  a        : Mode Simulasi Adaptive Timer (10% -> 40% -> 20% -> 0%)"));
   Serial.println(F("#  d        : Mode Tes Auto-Sweep Dimming (0% <-> 100%)"));
@@ -1774,6 +1828,7 @@ void handleSerial() {
   else if (in.equalsIgnoreCase("d")) startSweepMode();
   else if (in.equalsIgnoreCase("a1") || in.equalsIgnoreCase("lux")) startAdaptiveLuxMode();
   else if (in.equalsIgnoreCase("a2") || in.equalsIgnoreCase("pir")) startAdaptivePirMode();
+  else if (in.equalsIgnoreCase("a3") || in.equalsIgnoreCase("pircl")) startPirClMode();
   else if (in.equalsIgnoreCase("a")) startAdaptiveSimMode();
   else if (in.equalsIgnoreCase("fauto")) startAutoFaultTest();
   else if ((in.startsWith("f") || in.startsWith("F")) && isNumericString(in.substring(1))) {
@@ -1900,9 +1955,10 @@ void loop() {
       if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
       else                            applySyncedPWM(max(hplPercent - RAMP_STEP_PCT, targetPercent));
     }
-  } else if (currentDimMode == MODE_ADAPTIVE_PIR) {
-    // Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR)
-    targetPercent = computeLuxPirTarget(data.lux[0]);
+  } else if (currentDimMode == MODE_ADAPTIVE_PIR || currentDimMode == MODE_PIR_CL) {
+    // Mode Adaptive DENGAN PIR (BH1750 Ambient + Sensor Gerak PIR); a3: + closed-loop daya
+    int level = computeLuxPirTarget(data.lux[0]);
+    targetPercent = (currentDimMode == MODE_PIR_CL) ? pirClDuty(level) : level;
     if (hplPercent != targetPercent && millis() - lastRampStep >= RAMP_INTERVAL_MS) {
       lastRampStep = millis();
       if (hplPercent < targetPercent) applySyncedPWM(min(hplPercent + RAMP_STEP_PCT, targetPercent));
