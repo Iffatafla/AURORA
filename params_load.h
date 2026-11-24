@@ -22,7 +22,7 @@ constexpr KFParams<1> LOAD = {
   1,  // decimation (tick dasar per langkah filter)
   1000,  // dt [ms]
   10,  // panjang jendela rata-rata NIS
-  4.5189236f,  // ambang atas rata-rata NIS (bias / noise)
+  15.0f,  // ambang atas rata-rata NIS (dilonggarkan 4 Nov dari 4.52: transisi cepat PIR+closed-loop)
   0.13828302f  // ambang bawah rata-rata NIS (sensor beku)
 };
 constexpr int LOAD_FLAT_N = 30;

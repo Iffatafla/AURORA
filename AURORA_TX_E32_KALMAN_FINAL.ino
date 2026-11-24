@@ -697,8 +697,14 @@ void evaluateAnomalyLayers() {
   if (data.duty < 5.0f) {                       // lampu mati: tidak ada fault beban/lampu
     loadLatch = lampLatch = false; loadRatioCnt = lampRatioCnt = loadGoodCnt = lampGoodCnt = 0;
   } else if (rampSettlingSamples == 0) {        // saat transisi soft-ramp: status dipertahankan
-    bool loadRatio = mainValid && (data.mainW < (0.25f * expMainP) || data.mainW > (2.0f * expMainP));
-    bool lampRatio = lampValid && data.lux[1] < (0.15f * expLuxLamp);
+    // Revisi 5 Nov: batas rasio dari data 4 Nov (hardware sekarang): P_main ~ 1.7 W + 0.305 W per % duty,
+    // lux_lamp ~ 10 lux per % duty. Duty di atas 40 % (closed-loop) dipotong ke 40 agar lampu panas tidak
+    // dianggap rusak. Normal terendah (lampu panas): P 11.8 W & lux ~155 pada duty 40-60 %.
+    float dRef      = min(data.duty, 40.0f);
+    float expPRatio = 1.7f + 0.305f * dRef;          // 40 % -> 13.9 W
+    float expLRatio = 10.0f * dRef;                  // 40 % -> 400 lux
+    bool loadRatio = mainValid && dRef >= 20.0f && (data.mainW < (0.6f * expPRatio) || data.mainW > (2.0f * expPRatio));
+    bool lampRatio = lampValid && dRef >= 20.0f && data.lux[1] < (0.3f * expLRatio);
     loadRatioCnt = loadRatio ? loadRatioCnt + 1 : 0;
     lampRatioCnt = lampRatio ? lampRatioCnt + 1 : 0;
     bool loadRaw = mainValid && (ssLoad.flag || flatLoad.flag || loadRatioCnt >= FAULT_RATIO_N);
